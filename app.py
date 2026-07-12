@@ -17,6 +17,7 @@ import fitz  # PyMuPDF
 import pytesseract
 from pdf2image import convert_from_path
 from ebooklib import epub
+from cleaner import clean_ocr_text, extract_structure
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024
@@ -212,6 +213,12 @@ HTML_PAGE = """<!DOCTYPE html>
         </select>
       </div>
     </div>
+    <label style="display:flex;align-items:center;gap:.5rem;margin-top:1rem;
+                  font-size:.85rem;color:var(--text);cursor:pointer;">
+      <input type="checkbox" id="cleanOcr" checked
+             style="width:16px;height:16px;accent-color:var(--accent);">
+      Clean up OCR artifacts (fix broken lines, remove page numbers, headers)
+    </label>
     <button class="btn" id="convertBtn" style="width:100%;margin-top:1.5rem;"
       onclick="convert()" disabled>Convert to EPUB</button>
   </div>
@@ -285,6 +292,7 @@ async function convert() {
   fd.append('author', document.getElementById('bookAuthor').value || '');
   fd.append('lang', document.getElementById('ocrLang').value);
   fd.append('dpi', document.getElementById('dpi').value);
+  fd.append('clean_ocr', document.getElementById('cleanOcr').checked ? '1' : '0');
 
   document.getElementById('progress').classList.add('active');
   document.getElementById('convertBtn').disabled = true;
@@ -353,7 +361,7 @@ def update_job(job_id, **kw):
 
 # ── PDF → EPUB ──────────────────────────────────────────────────────────────
 
-def convert_pdf_to_epub(job_id, pdf_path, title, author, lang, dpi):
+def convert_pdf_to_epub(job_id, pdf_path, title, author, lang, dpi, clean_ocr=False):
     try:
         update_job(job_id, status="Opening PDF...", pct=5)
 
@@ -411,32 +419,63 @@ def convert_pdf_to_epub(job_id, pdf_path, title, author, lang, dpi):
         spine = [cover]
         chapters = []
 
-        pages_per_chapter = 10
-        for start in range(0, total, pages_per_chapter):
-            chunk = pages_text[start:start + pages_per_chapter]
-            end_page = min(start + len(chunk), total)
-            ch_title = f"Pages {start + 1}–{end_page}"
+        if clean_ocr:
+            # ── Run the OCR cleaner & use detected structure ──
+            update_job(job_id, status="Cleaning OCR text...", pct=92)
+            full_text = "\n".join(pages_text)
+            full_text = clean_ocr_text(full_text)
+            structure = extract_structure(full_text)
 
-            body_parts = []
-            for idx, pt in enumerate(chunk):
-                page_num = start + idx + 1
-                pt = re.sub(r"\n{3,}", "\n\n", pt.strip())
-                if pt:
-                    body_parts.append(
-                        f'<div class="page" id="p{page_num}"><p>{pt}</p></div>'
-                    )
+            for idx, sec in enumerate(structure):
+                heading = sec["heading"]
+                body = sec["body"]
+                # Convert plain text to HTML paragraphs
+                paras = body.split("\n\n")
+                body_html = "".join(
+                    f"<p>{p.strip()}</p>" for p in paras if p.strip()
+                )
+                ch_html = (
+                    "<html><head><style>p{text-indent:1.2em;"
+                    "line-height:1.6;margin:.4em 0}"
+                    "h2{text-align:center}</style></head><body>"
+                    f"<h2>{heading}</h2>{body_html}</body></html>"
+                )
+                ch_file = f"chap_{idx + 1:04d}.xhtml"
+                ch = epub.EpubHtml(title=heading, file_name=ch_file,
+                                   content=ch_html)
+                book.add_item(ch)
+                chapters.append(ch)
+                spine.append(ch)
+        else:
+            # ── Original: group every N pages ──
+            pages_per_chapter = 10
+            for start in range(0, total, pages_per_chapter):
+                chunk = pages_text[start:start + pages_per_chapter]
+                end_page = min(start + len(chunk), total)
+                ch_title = f"Pages {start + 1}–{end_page}"
 
-            ch_html = (
-                "<html><head><style>.page{margin-bottom:1.5em}</style></head><body>"
-                + "\n".join(body_parts)
-                + "</body></html>"
-            )
+                body_parts = []
+                for idx, pt in enumerate(chunk):
+                    page_num = start + idx + 1
+                    pt = re.sub(r"\n{3,}", "\n\n", pt.strip())
+                    if pt:
+                        body_parts.append(
+                            f'<div class="page" id="p{page_num}"><p>{pt}</p></div>'
+                        )
 
-            ch_file = f"chap_{start // pages_per_chapter + 1:04d}.xhtml"
-            ch = epub.EpubHtml(title=ch_title, file_name=ch_file, content=ch_html)
-            book.add_item(ch)
-            chapters.append(ch)
-            spine.append(ch)
+                ch_html = (
+                    "<html><head><style>.page{margin-bottom:1.5em}</style>"
+                    "</head><body>"
+                    + "\n".join(body_parts)
+                    + "</body></html>"
+                )
+
+                ch_file = f"chap_{start // pages_per_chapter + 1:04d}.xhtml"
+                ch = epub.EpubHtml(title=ch_title, file_name=ch_file,
+                                   content=ch_html)
+                book.add_item(ch)
+                chapters.append(ch)
+                spine.append(ch)
 
         book.spine = spine
         book.toc = chapters
@@ -570,13 +609,14 @@ def convert():
     author = request.form.get("author", "").strip()
     lang = request.form.get("lang", "eng")
     dpi = request.form.get("dpi", "300")
+    clean_ocr = request.form.get("clean_ocr", "0") == "1"
 
     if mode == "epub2pdf":
         target = convert_epub_to_pdf
         args = (job_id, in_path)
     else:
         target = convert_pdf_to_epub
-        args = (job_id, in_path, title, author, lang, dpi)
+        args = (job_id, in_path, title, author, lang, dpi, clean_ocr)
 
     t = threading.Thread(target=target, args=args, daemon=True)
     t.start()
