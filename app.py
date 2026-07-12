@@ -377,17 +377,17 @@ def convert_pdf_to_epub(job_id, pdf_path, title, author, lang, dpi, clean_ocr=Fa
             author = meta.get("author") or "Unknown"
 
         pages_text = []
-        needs_ocr = False
         for i in range(total):
             text = doc.load_page(i).get_text("text").strip()
             pages_text.append(text)
-            if i < 5 and len(text) < 50:
-                needs_ocr = True
-
-        if needs_ocr:
-            needs_ocr = any(len(t) < 20 for t in pages_text)
-
         doc.close()
+
+        # Decide whether OCR is needed: check median text length across
+        # a sample of pages, so blank/title pages don't trigger OCR on
+        # a PDF that already has a good text layer.
+        sample = pages_text[::max(1, total // 20)][:20]
+        median_len = sorted(len(t) for t in sample)[len(sample) // 2] if sample else 0
+        needs_ocr = median_len < 50
 
         if needs_ocr:
             update_job(job_id, status="Starting OCR (rendering + OCR, per page)...", pct=15)
