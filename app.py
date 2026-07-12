@@ -390,14 +390,22 @@ def convert_pdf_to_epub(job_id, pdf_path, title, author, lang, dpi, clean_ocr=Fa
         doc.close()
 
         if needs_ocr:
-            update_job(job_id, status="Rendering pages to images...", pct=15)
-            images = convert_from_path(pdf_path, dpi=int(dpi), fmt="png")
-            update_job(job_id, status="Running OCR (this may take a while)...", pct=25)
+            update_job(job_id, status="Starting OCR (rendering + OCR, per page)...", pct=15)
 
-            for i, img in enumerate(images):
-                text = pytesseract.image_to_string(img, lang=lang)
+            total = len(pages_text)
+            for i in range(total):
+                pct = 15 + int((i + 1) / total * 75)
+                # Render one page to image, OCR it, discard
+                imgs = convert_from_path(
+                    pdf_path,
+                    dpi=int(dpi),
+                    fmt="png",
+                    first_page=i + 1,
+                    last_page=i + 1,
+                )
+                text = pytesseract.image_to_string(imgs[0], lang=lang)
                 pages_text[i] = text.strip()
-                pct = 25 + int((i + 1) / total * 65)
+                # Small per-page progress bump
                 update_job(job_id, status=f"OCR page {i + 1} of {total}...",
                            pct=min(pct, 90))
         else:
