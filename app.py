@@ -403,8 +403,6 @@ def convert_pdf_to_epub(job_id, pdf_path, title, author, lang, dpi, clean_ocr=Fa
         else:
             update_job(job_id, status="Extracting text layer...", pct=90)
 
-        update_job(job_id, status="Building EPUB...", pct=92)
-
         book = epub.EpubBook()
         book.set_identifier(f"pdf2epub-{job_id}")
         book.set_title(title)
@@ -426,10 +424,10 @@ def convert_pdf_to_epub(job_id, pdf_path, title, author, lang, dpi, clean_ocr=Fa
             full_text = clean_ocr_text(full_text)
             structure = extract_structure(full_text)
 
+            total_ch = len(structure) or 1
             for idx, sec in enumerate(structure):
                 heading = sec["heading"]
                 body = sec["body"]
-                # Convert plain text to HTML paragraphs
                 paras = body.split("\n\n")
                 body_html = "".join(
                     f"<p>{p.strip()}</p>" for p in paras if p.strip()
@@ -446,36 +444,42 @@ def convert_pdf_to_epub(job_id, pdf_path, title, author, lang, dpi, clean_ocr=Fa
                 book.add_item(ch)
                 chapters.append(ch)
                 spine.append(ch)
+
+                pct = 93 + int((idx + 1) / total_ch * 6)
+                update_job(job_id, status=f"Building chapter {idx + 1} of {total_ch}...",
+                           pct=min(pct, 99))
         else:
             # ── Original: group every N pages ──
             pages_per_chapter = 10
-            for start in range(0, total, pages_per_chapter):
+            total_grps = max((total + pages_per_chapter - 1) // pages_per_chapter, 1)
+            for idx, start in enumerate(range(0, total, pages_per_chapter)):
                 chunk = pages_text[start:start + pages_per_chapter]
                 end_page = min(start + len(chunk), total)
                 ch_title = f"Pages {start + 1}–{end_page}"
 
                 body_parts = []
-                for idx, pt in enumerate(chunk):
-                    page_num = start + idx + 1
+                for pt in chunk:
                     pt = re.sub(r"\n{3,}", "\n\n", pt.strip())
                     if pt:
-                        body_parts.append(
-                            f'<div class="page" id="p{page_num}"><p>{pt}</p></div>'
-                        )
+                        body_parts.append(f"<p>{pt}</p>")
 
                 ch_html = (
-                    "<html><head><style>.page{margin-bottom:1.5em}</style>"
+                    "<html><head><style>p{margin-bottom:1em}</style>"
                     "</head><body>"
                     + "\n".join(body_parts)
                     + "</body></html>"
                 )
 
-                ch_file = f"chap_{start // pages_per_chapter + 1:04d}.xhtml"
+                ch_file = f"chap_{idx + 1:04d}.xhtml"
                 ch = epub.EpubHtml(title=ch_title, file_name=ch_file,
                                    content=ch_html)
                 book.add_item(ch)
                 chapters.append(ch)
                 spine.append(ch)
+
+                pct = 93 + int((idx + 1) / total_grps * 6)
+                update_job(job_id, status=f"Building chapter {idx + 1} of {total_grps}...",
+                           pct=min(pct, 99))
 
         book.spine = spine
         book.toc = chapters
