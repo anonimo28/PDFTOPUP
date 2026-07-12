@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PDF → EPUB converter: OCRs scanned PDFs and packages text into an EPUB."""
+"""PDF ↔ EPUB converter: OCR scanned PDFs to EPUB, or EPUB to PDF."""
 
 import os
 import re
@@ -9,6 +9,7 @@ import tempfile
 import traceback
 import uuid
 from pathlib import Path
+from html.parser import HTMLParser
 
 from flask import Flask, request, jsonify, send_file, render_template_string
 
@@ -18,7 +19,7 @@ from pdf2image import convert_from_path
 from ebooklib import epub
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200 MB
+app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024
 
 # ── System dependency checks ────────────────────────────────────────────────
 
@@ -42,6 +43,64 @@ def check_dependencies():
 
 check_dependencies()
 
+# ── HTML → plain text ──────────────────────────────────────────────────────
+
+class TextExtractor(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self._text = []
+        self._skip = False
+    def handle_starttag(self, tag, attrs):
+        if tag in ('script', 'style'):
+            self._skip = True
+        if tag in ('p', 'br', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'tr'):
+            self._text.append('\n')
+    def handle_endtag(self, tag):
+        if tag in ('script', 'style'):
+            self._skip = False
+        if tag in ('p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'tr'):
+            self._text.append('\n')
+    def handle_data(self, data):
+        if not self._skip:
+            self._text.append(data)
+    def get_text(self):
+        return re.sub(r'\n{3,}', '\n\n', ''.join(self._text)).strip()
+
+
+def strip_html(html):
+    ext = TextExtractor()
+    ext.feed(html)
+    return ext.get_text()
+
+
+# ── Word wrapping helpers for PDF generation ───────────────────────────────
+
+def word_wrap(text, max_chars):
+    words = text.split()
+    lines = []
+    cur = []
+    for w in words:
+        cur.append(w)
+        if len(' '.join(cur)) > max_chars:
+            cur.pop()
+            lines.append(' '.join(cur))
+            cur = [w]
+    if cur:
+        lines.append(' '.join(cur))
+    return lines
+
+
+def wrap_paragraphs(text, max_chars, paragraphs=None):
+    if paragraphs is None:
+        paragraphs = [p.strip() for p in text.split('\n') if p.strip()]
+    lines = []
+    for para in paragraphs:
+        wrapped = word_wrap(para, max_chars)
+        lines.extend(wrapped)
+        lines.append('')
+    return lines
+
+
 # ── Templates ───────────────────────────────────────────────────────────────
 
 HTML_PAGE = """<!DOCTYPE html>
@@ -49,17 +108,24 @@ HTML_PAGE = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PDF → EPUB Converter</title>
+<title>PDF ↔ EPUB Converter</title>
 <style>
   :root { --bg:#0f1117; --card:#1a1d27; --accent:#7c5cff; --accent2:#00d4aa;
-          --text:#e4e6eb; --muted:#888; --err:#ff5757; }
+          --text:#e4e6eb; --muted:#888; --err:#ff5757; --toggle-bg:#11131a; }
   * { box-sizing:border-box; margin:0; padding:0; }
   body { background:var(--bg); color:var(--text); font-family:-apple-system,
         BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; min-height:100vh;
         display:flex; align-items:center; justify-content:center; padding:2rem; }
   .container { max-width:560px; width:100%; }
   h1 { font-size:1.6rem; margin-bottom:.4rem; }
-  .subtitle { color:var(--muted); margin-bottom:2rem; font-size:.9rem; }
+  .subtitle { color:var(--muted); margin-bottom:1.5rem; font-size:.9rem; }
+  .mode-toggle { display:flex; border-radius:10px; overflow:hidden;
+    border:1px solid #333; margin-bottom:1.5rem; }
+  .mode-btn { flex:1; padding:.7rem; border:none; background:var(--toggle-bg);
+    color:var(--muted); font-size:.9rem; font-weight:600; cursor:pointer;
+    transition:all .2s; }
+  .mode-btn.active { background:var(--accent); color:#fff; }
+  .mode-btn:not(.active):hover { background:#1e1b2e; }
   .upload-box { background:var(--card); border-radius:16px; padding:2.5rem 2rem;
     text-align:center; border:2px dashed #333; transition:border-color .2s; }
   .upload-box.dragover { border-color:var(--accent); background:#1e1b2e; }
@@ -69,7 +135,6 @@ HTML_PAGE = """<!DOCTYPE html>
     transition:transform .1s, opacity .2s; }
   .btn:hover { transform:translateY(-1px); }
   .btn:disabled { opacity:.4; cursor:default; transform:none; }
-  .btn.secondary { background:transparent; border:1px solid #444; margin-top:1rem; }
   .or { color:var(--muted); margin:1.2rem 0; font-size:.85rem; }
   .meta-fields { margin-top:1.5rem; text-align:left; display:none; }
   .meta-fields.active { display:block; }
@@ -96,25 +161,30 @@ HTML_PAGE = """<!DOCTYPE html>
 </head>
 <body>
 <div class="container">
-  <h1>📕 → 📖 PDF to EPUB</h1>
-  <p class="subtitle">Upload a scanned PDF, get a text-based EPUB book back.</p>
+  <h1>📄 ↔ 📖 PDF & EPUB</h1>
+  <p class="subtitle" id="subtitle">Convert scanned PDFs to text EPUBs, or EPUBs to PDFs.</p>
+
+  <div class="mode-toggle">
+    <button class="mode-btn active" data-mode="pdf2epub" onclick="setMode('pdf2epub')">PDF → EPUB</button>
+    <button class="mode-btn" data-mode="epub2pdf" onclick="setMode('epub2pdf')">EPUB → PDF</button>
+  </div>
 
   <div class="upload-box" id="dropZone">
-    <input type="file" id="fileInput" accept="application/pdf">
-    <p>Drag & drop a PDF here</p>
+    <input type="file" id="fileInput" accept=".pdf,application/pdf">
+    <p id="dropText">Drag & drop a PDF here</p>
     <p class="or">— or —</p>
     <button class="btn" onclick="document.getElementById('fileInput').click()">
-      Choose PDF
+      Choose File
     </button>
     <div class="filename" id="fileName"></div>
   </div>
 
   <div class="meta-fields" id="metaFields">
     <label>Title</label>
-    <input type="text" id="bookTitle" placeholder="Auto-detect from PDF">
+    <input type="text" id="bookTitle" placeholder="Auto-detect">
     <label>Author</label>
     <input type="text" id="bookAuthor" placeholder="Unknown">
-    <div class="lang-row">
+    <div class="lang-row" id="ocrSection">
       <div>
         <label>OCR Language</label>
         <select id="ocrLang">
@@ -134,7 +204,7 @@ HTML_PAGE = """<!DOCTYPE html>
         </select>
       </div>
       <div>
-        <label>DPI (higher = better quality, slower)</label>
+        <label>DPI (higher = better, slower)</label>
         <select id="dpi">
           <option value="200">200 (fast)</option>
           <option value="300" selected>300 (balanced)</option>
@@ -154,8 +224,31 @@ HTML_PAGE = """<!DOCTYPE html>
 
 <script>
 let file = null;
+let mode = 'pdf2epub';
 const dz = document.getElementById('dropZone');
 const fi = document.getElementById('fileInput');
+
+function setMode(m) {
+  mode = m;
+  document.querySelectorAll('.mode-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.mode === m);
+  });
+  const toEpub = m === 'pdf2epub';
+  document.getElementById('dropText').textContent = toEpub
+    ? 'Drag & drop a PDF here' : 'Drag & drop an EPUB here';
+  fi.accept = toEpub ? '.pdf,application/pdf' : '.epub,application/epub+zip';
+  document.getElementById('subtitle').textContent = toEpub
+    ? 'Convert scanned PDFs to text EPUBs.' : 'Convert EPUBs to PDFs.';
+  document.getElementById('ocrSection').style.display = toEpub ? 'flex' : 'none';
+  document.getElementById('convertBtn').textContent = toEpub
+    ? 'Convert to EPUB' : 'Convert to PDF';
+  // Reset on mode switch
+  file = null;
+  document.getElementById('fileName').textContent = '';
+  document.getElementById('metaFields').classList.remove('active');
+  document.getElementById('convertBtn').disabled = true;
+  fi.value = '';
+}
 
 fi.addEventListener('change', e => { if(e.target.files[0]) selectFile(e.target.files[0]); });
 dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('dragover'); });
@@ -167,10 +260,17 @@ dz.addEventListener('drop', e => {
 
 function selectFile(f) {
   file = f;
-  document.getElementById('fileName').textContent = '✓ ' + f.name;
+  const ext = f.name.split('.').pop().toLowerCase();
+  if ((mode === 'pdf2epub' && ext !== 'pdf') || (mode === 'epub2pdf' && ext !== 'epub')) {
+    document.getElementById('statusText').innerHTML =
+      '<span class="error">Please select a ' + (mode==='pdf2epub'?'PDF':'EPUB') + ' file.</span>';
+    document.getElementById('fileName').textContent = '';
+    document.getElementById('convertBtn').disabled = true;
+    return;
+  }
+  document.getElementById('fileName').textContent = '\u2713 ' + f.name;
   document.getElementById('metaFields').classList.add('active');
-  // Auto-fill title from filename
-  const base = f.name.replace(/\\.pdf$/i, '').replace(/[_-]+/g,' ').trim();
+  const base = f.name.replace(/\\.[^/.]+$/, '').replace(/[_-]+/g,' ').trim();
   document.getElementById('bookTitle').placeholder = base;
   document.getElementById('convertBtn').disabled = false;
 }
@@ -179,7 +279,8 @@ let pollTimer = null;
 async function convert() {
   if(!file) return;
   const fd = new FormData();
-  fd.append('pdf', file);
+  fd.append('file', file);
+  fd.append('mode', mode);
   fd.append('title', document.getElementById('bookTitle').value || '');
   fd.append('author', document.getElementById('bookAuthor').value || '');
   fd.append('lang', document.getElementById('ocrLang').value);
@@ -217,8 +318,7 @@ async function poll(job) {
     if(s.pct >= 100 && s.done) {
       clearInterval(pollTimer);
       document.getElementById('statusText').innerHTML =
-        '<span class="success">✓ Done! Download starting...</span>';
-      // Trigger download without navigating away
+        '<span class="success">\u2713 Done! Download starting...</span>';
       const a = document.createElement('a');
       a.href = '/download/' + job;
       a.download = '';
@@ -251,17 +351,16 @@ def update_job(job_id, **kw):
     JOBS.setdefault(job_id, {}).update(kw)
 
 
+# ── PDF → EPUB ──────────────────────────────────────────────────────────────
+
 def convert_pdf_to_epub(job_id, pdf_path, title, author, lang, dpi):
-    """Worker: OCR each page, build an EPUB."""
     try:
         update_job(job_id, status="Opening PDF...", pct=5)
 
-        # First, try PyMuPDF to detect if PDF already has a text layer
         doc = fitz.open(pdf_path)
         total = doc.page_count
         update_job(job_id, status=f"Analyzing {total} pages...", pct=10)
 
-        # Extract metadata
         if not title:
             meta = doc.metadata
             title = meta.get("title") or Path(pdf_path).stem.replace("_", " ").title()
@@ -269,16 +368,14 @@ def convert_pdf_to_epub(job_id, pdf_path, title, author, lang, dpi):
             meta = doc.metadata
             author = meta.get("author") or "Unknown"
 
-        # Check if pages have extractable text (digitized PDF) or need OCR
         pages_text = []
         needs_ocr = False
         for i in range(total):
             text = doc.load_page(i).get_text("text").strip()
             pages_text.append(text)
-            if i < 5 and len(text) < 50:  # sample first 5 pages
+            if i < 5 and len(text) < 50:
                 needs_ocr = True
 
-        # If any of the sampled pages are empty, scan all to decide
         if needs_ocr:
             needs_ocr = any(len(t) < 20 for t in pages_text)
 
@@ -286,26 +383,18 @@ def convert_pdf_to_epub(job_id, pdf_path, title, author, lang, dpi):
 
         if needs_ocr:
             update_job(job_id, status="Rendering pages to images...", pct=15)
-            images = convert_from_path(
-                pdf_path,
-                dpi=int(dpi),
-                fmt="png",
-            )
+            images = convert_from_path(pdf_path, dpi=int(dpi), fmt="png")
             update_job(job_id, status="Running OCR (this may take a while)...", pct=25)
 
             for i, img in enumerate(images):
                 text = pytesseract.image_to_string(img, lang=lang)
                 pages_text[i] = text.strip()
                 pct = 25 + int((i + 1) / total * 65)
-                update_job(
-                    job_id,
-                    status=f"OCR page {i + 1} of {total}...",
-                    pct=min(pct, 90),
-                )
+                update_job(job_id, status=f"OCR page {i + 1} of {total}...",
+                           pct=min(pct, 90))
         else:
             update_job(job_id, status="Extracting text layer...", pct=90)
 
-        # ── Build EPUB ────────────────────────────────────────────────────
         update_job(job_id, status="Building EPUB...", pct=92)
 
         book = epub.EpubBook()
@@ -322,7 +411,6 @@ def convert_pdf_to_epub(job_id, pdf_path, title, author, lang, dpi):
         spine = [cover]
         chapters = []
 
-        # One chapter per 10 pages (group to avoid tiny chapters)
         pages_per_chapter = 10
         for start in range(0, total, pages_per_chapter):
             chunk = pages_text[start:start + pages_per_chapter]
@@ -334,12 +422,12 @@ def convert_pdf_to_epub(job_id, pdf_path, title, author, lang, dpi):
                 page_num = start + idx + 1
                 pt = re.sub(r"\n{3,}", "\n\n", pt.strip())
                 if pt:
-                    body_parts.append(f'<div class="page" id="p{page_num}"><p>{pt}</p></div>')
+                    body_parts.append(
+                        f'<div class="page" id="p{page_num}"><p>{pt}</p></div>'
+                    )
 
             ch_html = (
-                "<html><head><style>"
-                ".page { margin-bottom:1.5em; } "
-                "</style></head><body>"
+                "<html><head><style>.page{margin-bottom:1.5em}</style></head><body>"
                 + "\n".join(body_parts)
                 + "</body></html>"
             )
@@ -351,19 +439,14 @@ def convert_pdf_to_epub(job_id, pdf_path, title, author, lang, dpi):
             spine.append(ch)
 
         book.spine = spine
-
-        # Table of contents linking to chapter items
         book.toc = chapters
 
-        # Add navigation files
         book.add_item(epub.EpubNcx())
         book.add_item(epub.EpubNav())
 
-        # Write EPUB to temp file
         out_path = os.path.join(tempfile.gettempdir(), f"{job_id}.epub")
         epub.write_epub(out_path, book, {})
 
-        # Clean up the uploaded PDF
         try:
             os.unlink(pdf_path)
         except Exception:
@@ -377,8 +460,92 @@ def convert_pdf_to_epub(job_id, pdf_path, title, author, lang, dpi):
         update_job(job_id, error=str(e), status=f"Error: {e}", done=True)
 
 
-# ── Routes ───────────────────────────────────────────────────────────────────
+# ── EPUB → PDF ──────────────────────────────────────────────────────────────
 
+def convert_epub_to_pdf(job_id, epub_path):
+    try:
+        update_job(job_id, status="Opening EPUB...", pct=5)
+
+        book = epub.read_epub(epub_path)
+
+        title_meta = book.get_metadata("DC", "title")
+        title = title_meta[0][0] if title_meta else Path(epub_path).stem
+        author_meta = book.get_metadata("DC", "creator")
+        author = author_meta[0][0] if author_meta else "Unknown"
+
+        # Collect chapters in spine order, skip nav/toc
+        chapters = []
+        for item in book.get_items():
+            if isinstance(item, epub.EpubHtml) and item.file_name not in (
+                "nav.xhtml", "toc.ncx"
+            ):
+                chapters.append(item)
+
+        total = len(chapters)
+        if total == 0:
+            raise ValueError("No readable content found in EPUB")
+
+        update_job(job_id, status=f"Processing {total} chapters...", pct=10)
+
+        # PDF layout
+        margin = 72
+        font_size = 11
+        line_h = 15
+        page_w, page_h = 612, 792
+        text_w = page_w - 2 * margin
+        max_chars = int(text_w / (font_size * 0.55))
+
+        doc = fitz.open()
+
+        for i, ch in enumerate(chapters):
+            html = ch.get_content().decode("utf-8", errors="replace")
+            text = strip_html(html)
+            lines = wrap_paragraphs(text, max_chars)
+
+            pct = 10 + int((i + 1) / total * 82)
+            update_job(job_id, status=f"Chapter {i + 1} of {total}...",
+                       pct=min(pct, 92))
+
+            page = doc.new_page()
+            y = margin + 10
+
+            ch_title = ch.title or f"Chapter {i + 1}"
+            page.insert_text(
+                fitz.Point(margin, y), ch_title,
+                fontname="Helvetica-Bold", fontsize=14,
+            )
+            y += 24
+
+            for line in lines:
+                if y + line_h > page_h - margin:
+                    page = doc.new_page()
+                    y = margin
+                page.insert_text(
+                    fitz.Point(margin, y), line,
+                    fontname="Helvetica", fontsize=font_size,
+                )
+                y += line_h
+
+        update_job(job_id, status="Saving PDF...", pct=95)
+
+        out_path = os.path.join(tempfile.gettempdir(), f"{job_id}.pdf")
+        doc.save(out_path)
+        doc.close()
+
+        try:
+            os.unlink(epub_path)
+        except Exception:
+            pass
+
+        update_job(job_id, status="Done!", pct=100, done=True, out_path=out_path,
+                   out_name=f"{title}.pdf")
+
+    except Exception as e:
+        traceback.print_exc()
+        update_job(job_id, error=str(e), status=f"Error: {e}", done=True)
+
+
+# ── Routes ───────────────────────────────────────────────────────────────────
 
 @app.route("/")
 def index():
@@ -387,14 +554,15 @@ def index():
 
 @app.route("/convert", methods=["POST"])
 def convert():
-    f = request.files.get("pdf")
+    f = request.files.get("file")
     if not f:
         return jsonify({"error": "No file uploaded"}), 400
 
     job_id = uuid.uuid4().hex[:12]
-
-    pdf_path = os.path.join(tempfile.gettempdir(), f"{job_id}.pdf")
-    f.save(pdf_path)
+    mode = request.form.get("mode", "pdf2epub")
+    ext = "pdf" if mode == "epub2pdf" else "epub"
+    in_path = os.path.join(tempfile.gettempdir(), f"{job_id}.{mode.split('2')[0]}")
+    f.save(in_path)
 
     JOBS[job_id] = {"pct": 0, "status": "Queued...", "done": False}
 
@@ -403,11 +571,14 @@ def convert():
     lang = request.form.get("lang", "eng")
     dpi = request.form.get("dpi", "300")
 
-    t = threading.Thread(
-        target=convert_pdf_to_epub,
-        args=(job_id, pdf_path, title, author, lang, dpi),
-        daemon=True,
-    )
+    if mode == "epub2pdf":
+        target = convert_epub_to_pdf
+        args = (job_id, in_path)
+    else:
+        target = convert_pdf_to_epub
+        args = (job_id, in_path, title, author, lang, dpi)
+
+    t = threading.Thread(target=target, args=args, daemon=True)
     t.start()
 
     return jsonify({"job": job_id})
