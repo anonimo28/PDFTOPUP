@@ -4,18 +4,20 @@
 import os
 import re
 import time
+import io
 import threading
 import tempfile
 import traceback
 import uuid
 from pathlib import Path
 from html.parser import HTMLParser
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from flask import Flask, request, jsonify, send_file, render_template_string
 
 import fitz  # PyMuPDF
 import pytesseract
-from pdf2image import convert_from_path
+from PIL import Image
 from ebooklib import epub
 from cleaner import clean_ocr_text, extract_structure
 
@@ -31,10 +33,6 @@ def check_dependencies():
         subprocess.run(["tesseract", "--version"], capture_output=True, check=True)
     except Exception:
         missing.append("tesseract-ocr (install: brew install tesseract)")
-    try:
-        subprocess.run(["pdftoppm", "-v"], capture_output=True, check=True)
-    except Exception:
-        missing.append("poppler (install: brew install poppler)")
     if missing:
         print("ERROR: Missing system dependencies:")
         for m in missing:
@@ -207,9 +205,9 @@ HTML_PAGE = """<!DOCTYPE html>
       <div>
         <label>DPI (higher = better, slower)</label>
         <select id="dpi">
-          <option value="200">200 (fast)</option>
-          <option value="300" selected>300 (balanced)</option>
-          <option value="400">400 (high quality)</option>
+          <option value="200" selected>200 (fast, default)</option>
+          <option value="300">300 (slower, higher accuracy)</option>
+          <option value="400">400 (slowest, best for difficult scans)</option>
         </select>
       </div>
     </div>
@@ -218,6 +216,13 @@ HTML_PAGE = """<!DOCTYPE html>
       <input type="checkbox" id="cleanOcr" checked
              style="width:16px;height:16px;accent-color:var(--accent);">
       Clean up OCR artifacts (fix broken lines, remove page numbers, headers)
+    </label>
+    <label style="display:flex;align-items:center;gap:.5rem;margin-top:1rem;
+                  font-size:.85rem;color:var(--text);cursor:pointer;">
+      <input type="checkbox" id="fixFormat" checked
+             style="width:16px;height:16px;accent-color:var(--accent);">
+      Fix format for 6×9 academic book (Times New Roman, 1" margins, justified,
+      indented paragraphs, proper headings, running headers, page numbers)
     </label>
     <button class="btn" id="convertBtn" style="width:100%;margin-top:1.5rem;"
       onclick="convert()" disabled>Convert to EPUB</button>
@@ -293,6 +298,7 @@ async function convert() {
   fd.append('lang', document.getElementById('ocrLang').value);
   fd.append('dpi', document.getElementById('dpi').value);
   fd.append('clean_ocr', document.getElementById('cleanOcr').checked ? '1' : '0');
+  fd.append('fix_format', document.getElementById('fixFormat').checked ? '1' : '0');
 
   document.getElementById('progress').classList.add('active');
   document.getElementById('convertBtn').disabled = true;
@@ -361,7 +367,7 @@ def update_job(job_id, **kw):
 
 # ── PDF → EPUB ──────────────────────────────────────────────────────────────
 
-def convert_pdf_to_epub(job_id, pdf_path, title, author, lang, dpi, clean_ocr=False):
+def convert_pdf_to_epub(job_id, pdf_path, title, author, lang, dpi, clean_ocr=False, fix_format=False):
     try:
         update_job(job_id, status="Opening PDF...", pct=5)
 
@@ -390,24 +396,44 @@ def convert_pdf_to_epub(job_id, pdf_path, title, author, lang, dpi, clean_ocr=Fa
         needs_ocr = median_len < 50
 
         if needs_ocr:
-            update_job(job_id, status="Starting OCR (rendering + OCR, per page)...", pct=15)
+            dpi_val = int(dpi) if dpi else 200
+            workers = min(4, (os.cpu_count() or 2))
+            batch_size = workers * 2  # render this many, OCR them, discard
+            update_job(job_id,
+                       status=f"Starting OCR ({workers} workers, {dpi_val} dpi, "
+                              f"batch {batch_size})...",
+                       pct=15)
 
-            total = len(pages_text)
-            for i in range(total):
-                pct = 15 + int((i + 1) / total * 75)
-                # Render one page to image, OCR it, discard
-                imgs = convert_from_path(
-                    pdf_path,
-                    dpi=int(dpi),
-                    fmt="png",
-                    first_page=i + 1,
-                    last_page=i + 1,
-                )
-                text = pytesseract.image_to_string(imgs[0], lang=lang)
-                pages_text[i] = text.strip()
-                # Small per-page progress bump
-                update_job(job_id, status=f"OCR page {i + 1} of {total}...",
+            doc = fitz.open(pdf_path)
+            pages_text = [""] * total
+            pages_done = 0
+
+            def _ocr_image(page_idx, img):
+                txt = pytesseract.image_to_string(img, lang=lang).strip()
+                return page_idx, txt
+
+            for batch_start in range(0, total, batch_size):
+                batch_end = min(batch_start + batch_size, total)
+                # Render this batch of pages to PIL images
+                imgs = []
+                for pno in range(batch_start, batch_end):
+                    pix = doc.load_page(pno).get_pixmap(dpi=dpi_val)
+                    imgs.append((pno, Image.open(io.BytesIO(pix.tobytes("png")))))
+
+                # OCR the batch in parallel
+                with ThreadPoolExecutor(max_workers=workers) as ex:
+                    futures = [ex.submit(_ocr_image, pno, img) for pno, img in imgs]
+                    for fut in as_completed(futures):
+                        pno, txt = fut.result()
+                        pages_text[pno] = txt
+
+                pages_done = batch_end
+                pct = 15 + int(pages_done / total * 75)
+                update_job(job_id,
+                           status=f"OCR page {pages_done} of {total}...",
                            pct=min(pct, 90))
+
+            doc.close()
         else:
             update_job(job_id, status="Extracting text layer...", pct=90)
 
@@ -425,6 +451,29 @@ def convert_pdf_to_epub(job_id, pdf_path, title, author, lang, dpi, clean_ocr=Fa
         spine = [cover]
         chapters = []
 
+        # ── Apply formatting if requested ──
+        if fix_format:
+            # 6" × 9" academic book formatting
+            base_css = (
+                "@page { size: 6in 9in; margin: 1in; }"
+                "body { font-family: 'Times New Roman', serif; font-size: 10.5pt;"
+                "       line-height: 1.5; text-align: justify; }"
+                "p { text-indent: 1.5em; margin: 0 0 0.8em 0; }"
+                "p:first-of-type { text-indent: 0; }"
+                "h1.section { font-size: 14pt; font-weight: bold; text-align: center;"
+                "             text-transform: uppercase; letter-spacing: 2pt;"
+                "             margin: 2em 0 1.5em 0; page-break-before: always; }"
+                "h2.chapter { font-size: 12pt; font-weight: bold; text-align: center;"
+                "             margin: 1.5em 0 0.5em 0; }"
+                "h3.subhead { font-size: 11pt; font-weight: bold; font-style: italic;"
+                "             text-align: center; margin: 1.2em 0 0.8em 0; }"
+                ".running-header { font-size: 8pt; color: #666; text-align: center;"
+                "                  margin: 0 0 1em 0; }"
+                ".page-number { font-size: 8pt; color: #666; text-align: right; }"
+            )
+        else:
+            base_css = ""
+
         if clean_ocr:
             # ── Run the OCR cleaner & use detected structure ──
             update_job(job_id, status="Cleaning OCR text...", pct=92)
@@ -436,15 +485,35 @@ def convert_pdf_to_epub(job_id, pdf_path, title, author, lang, dpi, clean_ocr=Fa
             for idx, sec in enumerate(structure):
                 heading = sec["heading"]
                 body = sec["body"]
+                
+                # Apply heading level detection
+                if re.match(r"^SECTION \w+", heading, re.IGNORECASE):
+                    heading_tag = "h1"
+                    heading_class = "section"
+                elif re.match(r"^Chapter \d+", heading, re.IGNORECASE):
+                    heading_tag = "h2"
+                    heading_class = "chapter"
+                else:
+                    heading_tag = "h3"
+                    heading_class = "subhead"
+                
                 paras = body.split("\n\n")
                 body_html = "".join(
                     f"<p>{p.strip()}</p>" for p in paras if p.strip()
                 )
+                
+                # Add running header and page number if formatting requested
+                running_header = ""
+                if fix_format:
+                    running_header = (
+                        f'<div class="running-header">{title}</div>'
+                        f'<div class="page-number">Page {idx + 1}</div>'
+                    )
+                
                 ch_html = (
-                    "<html><head><style>p{text-indent:1.2em;"
-                    "line-height:1.6;margin:.4em 0}"
-                    "h2{text-align:center}</style></head><body>"
-                    f"<h2>{heading}</h2>{body_html}</body></html>"
+                    f"<html><head><style>{base_css}</style></head><body>"
+                    f"<{heading_tag} class=\"{heading_class}\">{heading}</{heading_tag}>"
+                    f"{running_header}{body_html}</body></html>"
                 )
                 ch_file = f"chap_{idx + 1:04d}.xhtml"
                 ch = epub.EpubHtml(title=heading, file_name=ch_file,
@@ -471,11 +540,18 @@ def convert_pdf_to_epub(job_id, pdf_path, title, author, lang, dpi, clean_ocr=Fa
                     if pt:
                         body_parts.append(f"<p>{pt}</p>")
 
+                # Add running header and page number if formatting requested
+                running_header = ""
+                if fix_format:
+                    running_header = (
+                        f'<div class="running-header">{title}</div>'
+                        f'<div class="page-number">Page {idx + 1}</div>'
+                    )
+                
                 ch_html = (
-                    "<html><head><style>p{margin-bottom:1em}</style>"
-                    "</head><body>"
-                    + "\n".join(body_parts)
-                    + "</body></html>"
+                    f"<html><head><style>{base_css}</style></head><body>"
+                    f"<h2 class=\"chapter\" style=\"text-align:center\">{ch_title}</h2>"
+                    f"{running_header}" + "\n".join(body_parts) + "</body></html>"
                 )
 
                 ch_file = f"chap_{idx + 1:04d}.xhtml"
@@ -620,15 +696,16 @@ def convert():
     title = request.form.get("title", "").strip()
     author = request.form.get("author", "").strip()
     lang = request.form.get("lang", "eng")
-    dpi = request.form.get("dpi", "300")
+    dpi = request.form.get("dpi", "200")
     clean_ocr = request.form.get("clean_ocr", "0") == "1"
+    fix_format = request.form.get("fix_format", "1") == "1"
 
     if mode == "epub2pdf":
         target = convert_epub_to_pdf
         args = (job_id, in_path)
     else:
         target = convert_pdf_to_epub
-        args = (job_id, in_path, title, author, lang, dpi, clean_ocr)
+        args = (job_id, in_path, title, author, lang, dpi, clean_ocr, fix_format)
 
     t = threading.Thread(target=target, args=args, daemon=True)
     t.start()
